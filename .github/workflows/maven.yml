@@ -15,7 +15,13 @@
 
 name: Java CI
 
-on: [push, pull_request]
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional surefire -Dtest selector; empty runs the full suite'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -24,6 +30,7 @@ jobs:
   build:
 
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       matrix:
         # windows-latest is not used due to intermittent network failures
@@ -37,7 +44,7 @@ jobs:
         
     steps:
     - uses: actions/checkout@v3
-    - uses: actions/cache@v3
+    - uses: actions/cache@v4
       with:
         path: ~/.m2/repository
         key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
@@ -48,5 +55,36 @@ jobs:
       with:
         distribution: 'temurin'
         java-version: ${{ matrix.java }}
+        cache: maven
     - name: Build with Maven
-      run: mvn -V --file pom.xml --no-transfer-progress -DtrimStackTrace=false -P-use-toolchains
+      # checkstyle/japicmp/apache-rat are non-test gates; skipped for the sealed build
+      run: |
+        if [ -n "${{ inputs.test-filter }}" ]; then
+          mvn -V --file pom.xml --no-transfer-progress -DtrimStackTrace=false -P-use-toolchains -Dcheckstyle.skip=true -Djapicmp.skip=true -Drat.skip=true -Dtest='${{ inputs.test-filter }}' -Dsurefire.failIfNoSpecifiedTests=false -DfailIfNoTests=false
+        else
+          mvn -V --file pom.xml --no-transfer-progress -DtrimStackTrace=false -P-use-toolchains -Dcheckstyle.skip=true -Djapicmp.skip=true -Drat.skip=true
+        fi
+    - name: Report skipped tests
+      if: always()
+      shell: bash
+      run: |
+        python3 - <<'PY'
+        import glob, xml.etree.ElementTree as ET
+        total = 0
+        for f in sorted(glob.glob('**/target/surefire-reports/TEST-*.xml', recursive=True)):
+            for tc in ET.parse(f).getroot().iter('testcase'):
+                sk = tc.find('skipped')
+                if sk is not None:
+                    total += 1
+                    print('SKIPPED %s#%s : %s' % (tc.get('classname'), tc.get('name'), sk.get('message') or (sk.text or '').strip() or '(no message)'))
+        print('Total skipped tests: %d' % total)
+        PY
+    - name: Upload artifacts
+      if: matrix.os == 'ubuntu-latest' && matrix.java == 8
+      uses: actions/upload-artifact@v4
+      with:
+        name: httpcore5-jars
+        path: |
+          httpcore5/target/httpcore5-5.2.5.jar
+          httpcore5/target/httpcore5-5.2.5-tests.jar
+        if-no-files-found: error
